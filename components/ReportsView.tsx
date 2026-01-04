@@ -1,7 +1,7 @@
 
 import React, { useState, useMemo } from 'react';
 import { Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Bar, Cell, PieChart, Pie, ComposedChart, Legend, Line, BarChart } from 'recharts';
-import { TrendingUp, DollarSign, ShoppingCart, UserCheck, ArrowUpRight, ArrowDownRight, Calendar, Filter, Download, FileSpreadsheet, Percent, Layers, PieChart as PieChartIcon, Tag, Wallet, Printer } from 'lucide-react';
+import { TrendingUp, DollarSign, ShoppingCart, UserCheck, ArrowUpRight, ArrowDownRight, Calendar, Filter, Download, FileSpreadsheet, Percent, Layers, PieChart as PieChartIcon, Tag, Wallet, Printer, History } from 'lucide-react';
 import { Transaction } from '../types';
 import { exportReportsToExcel } from '../services/exportService';
 

@@ -1,5 +1,5 @@
 {
-  "name": "GeminiPOS Pro",
+  "name": "My Pos",
   "description": "A high-performance Point of Sale (POS) system with AI-driven inventory insights, real-time analytics, and seamless checkout experience.",
   "requestFramePermissions": [
     "camera",
