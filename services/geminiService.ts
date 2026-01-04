@@ -59,6 +59,26 @@ export const getStoreInsights = async (products: Product[], transactions: Transa
   }
 };
 
+export const analyzeStockVisual = async (base64Image: string, products: Product[]) => {
+  try {
+    checkOnline();
+    const model = 'gemini-3-flash-preview';
+    const response = await ai.models.generateContent({
+      model,
+      contents: {
+        parts: [
+          { inlineData: { data: base64Image.split(',')[1], mimeType: 'image/jpeg' } },
+          { text: `Identify this product from our inventory. Match it exactly if possible. Inventory: ${JSON.stringify(products.map(p => ({ id: p.id, name: p.name, sku: p.sku })))}. Return ONLY the product ID or "NULL" if not found.` }
+        ]
+      }
+    });
+    return response.text.trim();
+  } catch (error) {
+    console.error("Visual Analysis Error:", error);
+    return "NULL";
+  }
+};
+
 export const getProfitAnalysis = async (revenue: number, expenses: number, purchases: number, categories: any[]) => {
   try {
     checkOnline();

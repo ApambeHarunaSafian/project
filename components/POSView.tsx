@@ -2,10 +2,13 @@
 import React, { useState, useMemo, useRef, useEffect } from 'react';
 import { 
   Plus, Minus, Trash2, CheckCircle2, ShoppingBag, CreditCard, 
-  Banknote, QrCode, Scan, X, Camera, Keyboard, Search, Shield, Tag, User as UserIcon, Clock, UserPlus, ChevronUp, Wallet, Phone, User as UserCircle, Printer, WifiOff, AlertCircle
+  Banknote, QrCode, Scan, X, Camera, Keyboard, Search, Shield, 
+  Tag, User as UserIcon, Clock, UserPlus, ChevronUp, Wallet, 
+  Phone, User as UserCircle, Printer, WifiOff, AlertCircle, Sparkles
 } from 'lucide-react';
 import { Product, CartItem, Transaction, Customer } from '../types';
 import { CATEGORIES } from '../constants';
+import { analyzeStockVisual } from '../services/geminiService';
 
 interface POSViewProps {
   products: Product[];
@@ -33,8 +36,10 @@ export const POSView: React.FC<POSViewProps> = ({
   const [selectedCustomerId, setSelectedCustomerId] = useState<string | null>(null);
   const [lastTransaction, setLastTransaction] = useState<Transaction | null>(null);
   const [isOnline, setIsOnline] = useState(navigator.onLine);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
   
   const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
     const handleStatus = () => setIsOnline(navigator.onLine);
@@ -65,6 +70,36 @@ export const POSView: React.FC<POSViewProps> = ({
       if (stream) stream.getTracks().forEach(track => track.stop());
     };
   }, [isScannerOpen]);
+
+  const handleAIScan = async () => {
+    if (!videoRef.current || isAnalyzing) return;
+    
+    setIsAnalyzing(true);
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = videoRef.current.videoWidth;
+      canvas.height = videoRef.current.videoHeight;
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        ctx.drawImage(videoRef.current, 0, 0);
+        const base64 = canvas.toDataURL('image/jpeg');
+        const productId = await analyzeStockVisual(base64, products);
+        
+        if (productId && productId !== 'NULL') {
+          const product = products.find(p => p.id === productId);
+          if (product) {
+            addToCart(product);
+            setIsScannerOpen(false);
+            alert(`AI Identified: ${product.name}`);
+          }
+        } else {
+          alert("AI couldn't identify the product. Try a clearer angle.");
+        }
+      }
+    } finally {
+      setIsAnalyzing(false);
+    }
+  };
   
   const filteredProducts = useMemo(() => {
     return products.filter(p => {
@@ -217,7 +252,7 @@ export const POSView: React.FC<POSViewProps> = ({
                  className="w-full bg-slate-50 border-none rounded-2xl py-2.5 pl-10 pr-4 text-sm focus:ring-2 focus:ring-indigo-500/20 outline-none"
                />
              </div>
-             <button onClick={() => setIsScannerOpen(true)} className="p-2.5 bg-slate-900 text-white rounded-xl hover:bg-slate-800 transition-all">
+             <button onClick={() => setIsScannerOpen(true)} className="p-2.5 bg-slate-900 text-white rounded-xl hover:bg-slate-800 transition-all flex items-center gap-2">
                 <Scan size={20} />
              </button>
           </div>
@@ -321,6 +356,38 @@ export const POSView: React.FC<POSViewProps> = ({
         </div>
       )}
 
+      {/* Scanner Modal */}
+      {isScannerOpen && (
+        <div className="fixed inset-0 z-[100] bg-slate-900/95 backdrop-blur-md flex flex-col items-center justify-center p-4">
+           <div className="relative w-full max-w-sm aspect-square bg-black rounded-3xl overflow-hidden border-2 border-indigo-500/50 mb-8">
+              <video ref={videoRef} autoPlay playsInline className="w-full h-full object-cover" />
+              <div className="absolute inset-0 border-[40px] border-slate-900/60 pointer-events-none"></div>
+              <div className="absolute top-1/2 left-0 right-0 h-0.5 bg-rose-500 shadow-[0_0_10px_rgba(244,63,94,0.8)] animate-pulse"></div>
+              
+              {isAnalyzing && (
+                <div className="absolute inset-0 bg-indigo-900/40 backdrop-blur-sm flex items-center justify-center">
+                   <div className="flex flex-col items-center gap-3">
+                      <div className="w-12 h-12 border-4 border-white/20 border-t-white rounded-full animate-spin"></div>
+                      <p className="text-white text-[10px] font-black uppercase tracking-widest">AI Vision Analyzing...</p>
+                   </div>
+                </div>
+              )}
+           </div>
+           <div className="flex gap-4">
+              <button 
+                onClick={handleAIScan}
+                disabled={isAnalyzing}
+                className="px-8 py-3 bg-indigo-600 text-white rounded-full font-black text-xs uppercase tracking-widest hover:bg-indigo-700 transition-all flex items-center gap-2 shadow-xl shadow-indigo-600/20 disabled:opacity-50"
+              >
+                <Sparkles size={20} /> {isAnalyzing ? 'Scanning...' : 'AI Visual Scan'}
+              </button>
+              <button onClick={() => setIsScannerOpen(false)} className="px-8 py-3 bg-white text-slate-900 rounded-full font-black text-xs uppercase tracking-widest hover:bg-slate-100 transition-all flex items-center gap-2">
+                <X size={20} /> Close
+              </button>
+           </div>
+        </div>
+      )}
+
       {/* Quick Add Customer Modal */}
       {isQuickAddOpen && (
         <div className="fixed inset-0 z-[100] bg-slate-900/60 backdrop-blur-md flex items-center justify-center p-4">
@@ -346,20 +413,6 @@ export const POSView: React.FC<POSViewProps> = ({
                 <button type="submit" className="w-full py-4 bg-indigo-600 text-white rounded-2xl font-black text-xs uppercase tracking-widest hover:bg-indigo-700 shadow-xl shadow-indigo-100 transition-all mt-4">Save Customer</button>
              </form>
           </div>
-        </div>
-      )}
-
-      {/* Scanner Modal */}
-      {isScannerOpen && (
-        <div className="fixed inset-0 z-[100] bg-slate-900/90 backdrop-blur-md flex flex-col items-center justify-center p-4">
-           <div className="relative w-full max-w-sm aspect-square bg-black rounded-3xl overflow-hidden border-2 border-indigo-500/50 mb-8">
-              <video ref={videoRef} autoPlay playsInline className="w-full h-full object-cover" />
-              <div className="absolute inset-0 border-[40px] border-slate-900/60 pointer-events-none"></div>
-              <div className="absolute top-1/2 left-0 right-0 h-0.5 bg-rose-500 shadow-[0_0_10px_rgba(244,63,94,0.8)] animate-pulse"></div>
-           </div>
-           <button onClick={() => setIsScannerOpen(false)} className="px-8 py-3 bg-white text-slate-900 rounded-full font-black text-xs uppercase tracking-widest hover:bg-slate-100 transition-all flex items-center gap-2">
-              <X size={20} /> Close Scanner
-           </button>
         </div>
       )}
     </div>

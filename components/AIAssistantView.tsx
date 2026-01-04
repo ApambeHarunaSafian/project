@@ -1,8 +1,13 @@
 
 import React, { useState, useRef, useEffect } from 'react';
-import { Send, BrainCircuit, Sparkles, AlertTriangle, Lightbulb, TrendingUp, RefreshCw, Package, Tag, Zap, ChevronRight, WifiOff } from 'lucide-react';
+import { 
+  Send, BrainCircuit, Sparkles, AlertTriangle, Lightbulb, 
+  TrendingUp, RefreshCw, Package, Tag, Zap, ChevronRight, 
+  WifiOff, Mic, MicOff, Volume2, History
+} from 'lucide-react';
 import { Product, Transaction } from '../types';
 import { getStoreInsights, generateInventoryReport } from '../services/geminiService';
+import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
 
 interface AIAssistantViewProps {
   products: Product[];
@@ -10,20 +15,69 @@ interface AIAssistantViewProps {
   isOnline: boolean;
 }
 
+// Utility functions for Audio encoding/decoding as required by Live API
+function encode(bytes: Uint8Array) {
+  let binary = '';
+  const len = bytes.byteLength;
+  for (let i = 0; i < len; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+function decode(base64: string) {
+  const binaryString = atob(base64);
+  const len = binaryString.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes;
+}
+
+async function decodeAudioData(
+  data: Uint8Array,
+  ctx: AudioContext,
+  sampleRate: number,
+  numChannels: number,
+): Promise<AudioBuffer> {
+  const dataInt16 = new Int16Array(data.buffer);
+  const frameCount = dataInt16.length / numChannels;
+  const buffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
+
+  for (let channel = 0; channel < numChannels; channel++) {
+    const channelData = buffer.getChannelData(channel);
+    for (let i = 0; i < frameCount; i++) {
+      channelData[i] = dataInt16[i * numChannels + channel] / 32768.0;
+    }
+  }
+  return buffer;
+}
+
 export const AIAssistantView: React.FC<AIAssistantViewProps> = ({ products, transactions, isOnline }) => {
   const [messages, setMessages] = useState<{ role: 'user' | 'ai', content: string }[]>([
-    { role: 'ai', content: "Hello! I'm Gemini, your strategic retail intelligence partner. I've analyzed your current inventory, pricing structure, and recent sales trends. How can I help you optimize your business today?" }
+    { role: 'ai', content: "Hello! I'm Gemini, your strategic retail intelligence partner. How can I help you optimize your business today?" }
   ]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [report, setReport] = useState<any>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
+  // Live API States
+  const [isLiveActive, setIsLiveActive] = useState(false);
+  const [liveTranscript, setLiveTranscript] = useState('');
+  const [liveModelResponse, setLiveModelResponse] = useState('');
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const outputAudioContextRef = useRef<AudioContext | null>(null);
+  const nextStartTimeRef = useRef(0);
+  const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
+  const sessionRef = useRef<any>(null);
+
   useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [messages]);
+  }, [messages, liveTranscript, liveModelResponse]);
 
   const handleSend = async (customPrompt?: string) => {
     if (!isOnline) return;
@@ -40,6 +94,118 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({ products, tran
     } finally {
       setIsLoading(false);
     }
+  };
+
+  const startLiveSession = async () => {
+    if (isLiveActive) {
+      stopLiveSession();
+      return;
+    }
+
+    try {
+      setIsLiveActive(true);
+      setLiveTranscript('');
+      setLiveModelResponse('');
+      
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const inputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({sampleRate: 16000});
+      const outputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({sampleRate: 24000});
+      audioContextRef.current = inputCtx;
+      outputAudioContextRef.current = outputCtx;
+
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      
+      const sessionPromise = ai.live.connect({
+        model: 'gemini-2.5-flash-native-audio-preview-09-2025',
+        callbacks: {
+          onopen: () => {
+            const source = inputCtx.createMediaStreamSource(stream);
+            const scriptProcessor = inputCtx.createScriptProcessor(4096, 1, 1);
+            scriptProcessor.onaudioprocess = (e) => {
+              const inputData = e.inputBuffer.getChannelData(0);
+              const l = inputData.length;
+              const int16 = new Int16Array(l);
+              for (let i = 0; i < l; i++) {
+                int16[i] = inputData[i] * 32768;
+              }
+              const pcmBlob = {
+                data: encode(new Uint8Array(int16.buffer)),
+                mimeType: 'audio/pcm;rate=16000',
+              };
+              sessionPromise.then(session => {
+                session.sendRealtimeInput({ media: pcmBlob });
+              });
+            };
+            source.connect(scriptProcessor);
+            scriptProcessor.connect(inputCtx.destination);
+          },
+          onmessage: async (message: LiveServerMessage) => {
+            if (message.serverContent?.inputTranscription) {
+              setLiveTranscript(prev => prev + message.serverContent!.inputTranscription!.text);
+            }
+            if (message.serverContent?.outputTranscription) {
+              setLiveModelResponse(prev => prev + message.serverContent!.outputTranscription!.text);
+            }
+
+            const audioData = message.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
+            if (audioData) {
+              const ctx = outputAudioContextRef.current!;
+              nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
+              const buffer = await decodeAudioData(decode(audioData), ctx, 24000, 1);
+              const source = ctx.createBufferSource();
+              source.buffer = buffer;
+              source.connect(ctx.destination);
+              source.start(nextStartTimeRef.current);
+              nextStartTimeRef.current += buffer.duration;
+              sourcesRef.current.add(source);
+              source.onended = () => sourcesRef.current.delete(source);
+            }
+
+            if (message.serverContent?.interrupted) {
+              sourcesRef.current.forEach(s => s.stop());
+              sourcesRef.current.clear();
+              nextStartTimeRef.current = 0;
+            }
+
+            if (message.serverContent?.turnComplete) {
+              setMessages(prev => [
+                ...prev, 
+                { role: 'user', content: "[Voice] " + liveTranscript },
+                { role: 'ai', content: liveModelResponse }
+              ]);
+              setLiveTranscript('');
+              setLiveModelResponse('');
+            }
+          },
+          onclose: () => stopLiveSession(),
+          onerror: (e) => {
+            console.error("Live API Error:", e);
+            stopLiveSession();
+          }
+        },
+        config: {
+          responseModalities: [Modality.AUDIO],
+          inputAudioTranscription: {},
+          outputAudioTranscription: {},
+          systemInstruction: `You are Gemini, a world-class retail advisor for GeminiPOS Pro. You are currently in a Live Audio session with the store owner in Ghana. Speak naturally and concisely. You have access to the store's inventory and sales context.`
+        }
+      });
+
+      sessionRef.current = await sessionPromise;
+    } catch (err) {
+      console.error("Failed to start Live API:", err);
+      stopLiveSession();
+    }
+  };
+
+  const stopLiveSession = () => {
+    setIsLiveActive(false);
+    if (audioContextRef.current) audioContextRef.current.close();
+    if (outputAudioContextRef.current) outputAudioContextRef.current.close();
+    if (sessionRef.current) sessionRef.current.close();
+    audioContextRef.current = null;
+    outputAudioContextRef.current = null;
+    sessionRef.current = null;
   };
 
   const loadAIReport = async () => {
@@ -60,7 +226,7 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({ products, tran
       id: 'restock', 
       label: 'Restock List', 
       desc: 'Suggest order quantities',
-      prompt: "Perform a deep-dive restock analysis. Identify items that are critically low and suggest exact order quantities based on their current stock vs potential demand.",
+      prompt: "Perform a deep-dive restock analysis. Identify items that are critically low and suggest exact order quantities.",
       icon: <Package className="text-orange-500" size={18} />,
       bg: 'bg-orange-50'
     },
@@ -68,7 +234,7 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({ products, tran
       id: 'clearance', 
       label: 'Clearance Strategy', 
       desc: 'Move slow inventory',
-      prompt: "Identify slow-moving inventory items. For items with high stock but low sales, suggest a specific discounting strategy (e.g., GH₵ X discount or % off) to clear them efficiently.",
+      prompt: "Identify slow-moving inventory items and suggest a specific discounting strategy to clear them.",
       icon: <Tag className="text-rose-500" size={18} />,
       bg: 'bg-rose-50'
     },
@@ -76,7 +242,7 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({ products, tran
       id: 'margins', 
       label: 'Margin Spotlight', 
       desc: 'Promote high-profit',
-      prompt: "Analyze the current inventory to find high-margin items (Price minus Cost). Suggest a marketing or bundling strategy to feature these products to maximize net profit.",
+      prompt: "Analyze inventory for high-margin items and suggest marketing tactics.",
       icon: <TrendingUp className="text-emerald-500" size={18} />,
       bg: 'bg-emerald-50'
     }
@@ -91,14 +257,7 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({ products, tran
                  <WifiOff size={40} />
               </div>
               <h3 className="text-2xl font-black text-slate-800 mb-2">Neural Engine Offline</h3>
-              <p className="text-slate-500 text-sm leading-relaxed mb-8">
-                The Gemini AI Assistant requires a live internet connection to perform deep data analysis and generate strategic insights. 
-                Your sales and inventory are still being tracked locally!
-              </p>
-              <div className="bg-indigo-50 px-6 py-3 rounded-2xl border border-indigo-100 flex items-center gap-2">
-                 <div className="w-2 h-2 rounded-full bg-indigo-500 animate-pulse"></div>
-                 <span className="text-xs font-black text-indigo-600 uppercase tracking-widest">Awaiting Reconnection...</span>
-              </div>
+              <p className="text-slate-500 text-sm leading-relaxed mb-8">AI Assistant requires internet connection.</p>
            </div>
         </div>
       )}
@@ -109,29 +268,36 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({ products, tran
             <Sparkles className="text-indigo-600" />
             Gemini AI Insights
           </h2>
-          <p className="text-slate-500 text-sm">Automated business intelligence and strategy suggestions.</p>
+          <p className="text-slate-500 text-sm">Automated business intelligence and real-time strategy.</p>
         </div>
-        <button 
-          onClick={loadAIReport}
-          disabled={isLoading || !isOnline}
-          className="flex items-center gap-2 bg-indigo-600 px-6 py-2.5 rounded-xl font-bold text-sm text-white hover:bg-indigo-700 shadow-lg shadow-indigo-100 transition-all disabled:opacity-50"
-        >
-          <RefreshCw size={18} className={isLoading ? 'animate-spin' : ''} />
-          Refresh Smart Report
-        </button>
+        <div className="flex gap-2">
+          <button 
+            onClick={startLiveSession}
+            disabled={!isOnline}
+            className={`flex items-center gap-2 px-6 py-2.5 rounded-xl font-bold text-sm shadow-lg transition-all ${isLiveActive ? 'bg-rose-600 text-white animate-pulse' : 'bg-white border border-slate-200 text-indigo-600 hover:bg-slate-50'}`}
+          >
+            {isLiveActive ? <MicOff size={18} /> : <Mic size={18} />}
+            {isLiveActive ? 'End Live Session' : 'Start Voice Chat'}
+          </button>
+          <button 
+            onClick={loadAIReport}
+            disabled={isLoading || !isOnline}
+            className="flex items-center gap-2 bg-indigo-600 px-6 py-2.5 rounded-xl font-bold text-sm text-white hover:bg-indigo-700 shadow-lg shadow-indigo-100 transition-all disabled:opacity-50"
+          >
+            <RefreshCw size={18} className={isLoading ? 'animate-spin' : ''} />
+            Refresh Report
+          </button>
+        </div>
       </div>
 
       <div className="flex-1 grid grid-cols-1 lg:grid-cols-3 gap-8 min-h-0">
-        {/* Chat & Commands Interface */}
         <div className="lg:col-span-2 flex flex-col gap-6 min-h-0">
-          
-          {/* Strategic Commands Section */}
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 shrink-0">
             {strategicCommands.map(cmd => (
               <button
                 key={cmd.id}
                 onClick={() => handleSend(cmd.prompt)}
-                disabled={isLoading || !isOnline}
+                disabled={isLoading || !isOnline || isLiveActive}
                 className="flex flex-col items-start p-4 bg-white rounded-3xl border border-slate-100 shadow-sm hover:shadow-md hover:border-indigo-200 transition-all group text-left disabled:opacity-50"
               >
                 <div className={`w-10 h-10 ${cmd.bg} rounded-2xl flex items-center justify-center mb-3 group-hover:scale-110 transition-transform`}>
@@ -146,18 +312,17 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({ products, tran
             ))}
           </div>
 
-          {/* Chat Interface */}
           <div className="flex-1 bg-white rounded-[2.5rem] border border-slate-100 shadow-sm flex flex-col overflow-hidden">
             <div className="p-4 border-b border-slate-100 flex items-center justify-between bg-slate-50/50">
               <div className="flex items-center gap-2">
-                <div className="w-8 h-8 bg-indigo-600 rounded-lg flex items-center justify-center text-white">
+                <div className={`w-8 h-8 ${isLiveActive ? 'bg-rose-600' : 'bg-indigo-600'} rounded-lg flex items-center justify-center text-white transition-colors`}>
                   <BrainCircuit size={16} />
                 </div>
-                <span className="text-sm font-black text-slate-800 uppercase tracking-widest">Business Advisor</span>
+                <span className="text-sm font-black text-slate-800 uppercase tracking-widest">{isLiveActive ? 'Live Voice Connection' : 'Business Advisor'}</span>
               </div>
               <div className="flex items-center gap-1.5 px-2 py-0.5 bg-emerald-50 rounded-full border border-emerald-100">
                 <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></div>
-                <span className="text-[8px] font-black text-emerald-600 uppercase tracking-tighter">Inventory Context Linked</span>
+                <span className="text-[8px] font-black text-emerald-600 uppercase tracking-tighter">Inventory Sync Active</span>
               </div>
             </div>
 
@@ -176,6 +341,27 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({ products, tran
                   </div>
                 </div>
               ))}
+              
+              {isLiveActive && (
+                <div className="space-y-4">
+                  {liveTranscript && (
+                    <div className="flex justify-end">
+                      <div className="max-w-[85%] px-5 py-3.5 rounded-2xl text-sm leading-relaxed bg-rose-50 text-rose-900 border border-rose-100 italic rounded-tr-none">
+                        Talking: "{liveTranscript}"
+                      </div>
+                    </div>
+                  )}
+                  {liveModelResponse && (
+                    <div className="flex justify-start">
+                      <div className="max-w-[85%] px-5 py-3.5 rounded-2xl text-sm leading-relaxed bg-indigo-600 text-white rounded-tl-none flex items-center gap-3">
+                        <Volume2 size={16} className="shrink-0 animate-pulse" />
+                        "{liveModelResponse}"
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
               {isLoading && (
                 <div className="flex justify-start">
                   <div className="bg-slate-50 border border-slate-100 px-5 py-4 rounded-2xl rounded-tl-none flex items-center gap-3">
@@ -197,13 +383,13 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({ products, tran
                   value={input}
                   onChange={(e) => setInput(e.target.value)}
                   onKeyDown={(e) => e.key === 'Enter' && handleSend()}
-                  disabled={!isOnline}
-                  placeholder={isOnline ? "Ask for custom analysis or strategy..." : "Neural engine is currently offline."}
+                  disabled={!isOnline || isLiveActive}
+                  placeholder={isLiveActive ? "Voice session active..." : (isOnline ? "Ask for custom analysis..." : "Offline.")}
                   className="flex-1 bg-white border border-slate-200 rounded-2xl px-5 py-3 text-sm font-medium outline-none focus:ring-4 focus:ring-indigo-500/10 transition-all placeholder:text-slate-300 disabled:opacity-50"
                 />
                 <button 
                   onClick={() => handleSend()}
-                  disabled={isLoading || !input.trim() || !isOnline}
+                  disabled={isLoading || !input.trim() || !isOnline || isLiveActive}
                   className="p-3 bg-indigo-600 text-white rounded-2xl hover:bg-indigo-700 transition-all shadow-lg shadow-indigo-200 disabled:opacity-50 active:scale-95"
                 >
                   <Send size={20} />
@@ -213,11 +399,9 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({ products, tran
           </div>
         </div>
 
-        {/* Intelligence Board */}
         <div className="space-y-6 overflow-y-auto pr-2 custom-scrollbar">
           {report ? (
             <>
-              {/* Restock Alerts */}
               <div className="bg-white p-6 rounded-3xl border border-slate-100 shadow-sm relative overflow-hidden group">
                 <div className="flex items-center gap-2 mb-4 text-orange-600 relative z-10">
                   <AlertTriangle size={20} />
@@ -231,10 +415,8 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({ products, tran
                     </li>
                   ))}
                 </ul>
-                <div className="absolute top-0 right-0 w-24 h-24 bg-orange-50 rounded-full -mr-12 -mt-12 group-hover:scale-110 transition-transform"></div>
               </div>
 
-              {/* Marketing Suggestions */}
               <div className="bg-indigo-600 p-6 rounded-3xl shadow-xl shadow-indigo-100 text-white relative overflow-hidden group">
                 <div className="flex items-center gap-2 mb-4 relative z-10">
                   <Lightbulb size={20} className="text-indigo-200" />
@@ -248,21 +430,6 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({ products, tran
                     </li>
                   ))}
                 </ul>
-                <div className="absolute bottom-0 right-0 w-32 h-32 bg-white/10 rounded-full -mr-16 -mb-16 blur-2xl"></div>
-              </div>
-
-              {/* Performance Summary */}
-              <div className="bg-white p-6 rounded-3xl border border-slate-100 shadow-sm relative group">
-                <div className="flex items-center gap-2 mb-4 text-emerald-600">
-                  <TrendingUp size={20} />
-                  <h3 className="font-black text-sm uppercase tracking-wider">Quick Summary</h3>
-                </div>
-                <p className="text-xs font-medium text-slate-600 leading-relaxed italic border-l-4 border-emerald-100 pl-4">
-                  "{report.summary}"
-                </p>
-                <div className="absolute top-4 right-4 text-slate-100 group-hover:text-emerald-50 transition-colors">
-                  <Zap size={32} />
-                </div>
               </div>
             </>
           ) : (
@@ -271,23 +438,8 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({ products, tran
                 <BrainCircuit size={40} />
               </div>
               <p className="text-sm font-black text-slate-400 uppercase tracking-widest leading-relaxed">Run Smart Report to<br/>activate deep insights</p>
-              <button 
-                onClick={loadAIReport}
-                disabled={!isOnline}
-                className="mt-6 text-[10px] font-black text-indigo-600 uppercase tracking-[0.2em] hover:underline disabled:opacity-50"
-              >
-                Launch Intelligence
-              </button>
             </div>
           )}
-          
-          <div className="p-6 bg-slate-900 rounded-3xl text-white">
-            <h4 className="text-[10px] font-black uppercase tracking-widest text-indigo-400 mb-2">Model Version</h4>
-            <p className="text-xs font-medium text-slate-300">Gemini 3.0 Flash</p>
-            <p className="text-[10px] text-slate-500 mt-4 leading-relaxed">
-              Proprietary retail algorithms optimized for Ghanaian SME growth and supply chain efficiency.
-            </p>
-          </div>
         </div>
       </div>
     </div>
